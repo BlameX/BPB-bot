@@ -220,6 +220,8 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             console.log('Worker creation error:', workerError.message);
             if (workerError.response) {
                 console.log('Worker creation error response:', workerError.response.data);
+                console.log('Worker creation error status:', workerError.response.status);
+                console.log('Worker creation error headers:', workerError.response.headers);
             }
             throw new Error('Failed to create worker: ' + workerError.message);
         }
