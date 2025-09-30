@@ -208,7 +208,7 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
         
         await bot.sendMessage(chatId, `🔐 Generated credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
 
-        // Step 7: Set KV binding
+        // Step 7: Set KV binding (this was working!)
         await bot.sendMessage(chatId, "🔗 Binding KV namespace to worker...");
         
         try {
@@ -240,7 +240,7 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             await bot.sendMessage(chatId, "❌ Failed to bind KV namespace. Please set manually in Cloudflare dashboard.");
         }
 
-        // Step 8: Set secrets
+        // Step 8: Set secrets using the correct API endpoint
         await bot.sendMessage(chatId, "🔐 Setting worker secrets...");
         
         try {
