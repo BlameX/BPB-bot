@@ -1,24 +1,13 @@
 {
-  "name": "bpb-automation-bot",
+  "name": "bpb-telegram-cf-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for automating BPB Worker Panel deployment on Cloudflare",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
-  },
-  "keywords": ["telegram", "bot", "cloudflare", "bpb", "automation"],
-  "author": "Your Name",
-  "license": "MIT",
+  "type": "module",
+  "private": true,
   "dependencies": {
-    "node-telegram-bot-api": "^0.64.0",
-    "axios": "^1.6.0",
-    "form-data": "^4.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.0"
-  },
-  "engines": {
-    "node": ">=16.0.0"
+    "axios": "^1.7.2",
+    "better-sqlite3": "^9.4.0",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.0",
+    "telegraf": "^4.16.3"
   }
 }
