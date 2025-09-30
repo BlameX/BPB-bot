@@ -167,7 +167,32 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
 
         await bot.sendMessage(chatId, "✅ Worker created successfully!");
 
-        // Step 4: Create KV namespace
+        // Step 4: Enable workers.dev subdomain
+        await bot.sendMessage(chatId, "🌐 Enabling workers.dev subdomain...");
+        
+        try {
+            const subdomainResponse = await axios.put(
+                `${CF_API_BASE}/accounts/${accountId}/workers/subdomain`,
+                { enabled: true },
+                { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
+            );
+
+            if (subdomainResponse.data.success) {
+                await bot.sendMessage(chatId, "✅ Workers.dev subdomain enabled!");
+            } else {
+                console.log('Subdomain enable failed:', subdomainResponse.data.errors);
+                await bot.sendMessage(chatId, "⚠️ Subdomain API failed - please enable workers.dev manually in Cloudflare dashboard");
+            }
+        } catch (subdomainError) {
+            console.log('Subdomain enable error:', {
+                message: subdomainError.message,
+                response: subdomainError.response?.data,
+                status: subdomainError.response?.status
+            });
+            await bot.sendMessage(chatId, "⚠️ Subdomain configuration failed - please enable workers.dev manually in Cloudflare dashboard");
+        }
+
+        // Step 5: Create KV namespace
         await bot.sendMessage(chatId, "🗄️ Creating KV namespace...");
         const kvResponse = await axios.post(
             `${CF_API_BASE}/accounts/${accountId}/storage/kv/namespaces`,
@@ -182,15 +207,37 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
         const kvNamespaceId = kvResponse.data.result.id;
         await bot.sendMessage(chatId, "✅ KV namespace created!");
 
-        // Step 5: Generate credentials that the worker will use
-        await bot.sendMessage(chatId, "🔐 Generating credentials for BPB panel...");
-        
-        const uuid = generateUUID();
-        const trojanPass = generateTrojanPassword();
-        
-        await bot.sendMessage(chatId, `🔐 Generated credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
+        // Step 6: Get worker URL and wait for it to be ready
+        const workerUrl = `https://${workerName}.${accountId.slice(0, 8)}.workers.dev`;
+        const panelUrl = `${workerUrl}/panel`;
+        await bot.sendMessage(chatId, `🔗 Worker URL: ${workerUrl}`);
+        await bot.sendMessage(chatId, "⏳ Waiting for worker to initialize...");
+        await sleep(30000); // Wait 30 seconds
 
-        // Step 6: Set Secrets and Bindings
+        // Step 7: Fetch the REAL credentials from the panel's secret generator page
+        let uuid, trojanPass;
+        try {
+            await bot.sendMessage(chatId, "🔍 Fetching credentials from BPB panel's secret generator...");
+            const secretsResponse = await axios.get(`${workerUrl}/secrets`, { timeout: 15000 });
+            
+            const htmlContent = secretsResponse.data;
+            const uuidMatch = htmlContent.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+            const trojanMatch = htmlContent.match(/Random Trojan Password<[^>]+>([^<]+)/);
+
+            if (uuidMatch && trojanMatch) {
+                uuid = uuidMatch[0];
+                trojanPass = trojanMatch[1].trim();
+                await bot.sendMessage(chatId, `✅ Fetched credentials from panel:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
+            } else {
+                throw new Error("Could not parse credentials from the panel's /secrets page.");
+            }
+        } catch (fetchError) {
+            console.error("Credential fetching failed:", fetchError.message);
+            await bot.sendMessage(chatId, "❌ Critical error: Could not fetch credentials from the panel. The worker cannot be configured. Please check the worker URL manually.");
+            return; // Stop execution if we can't get credentials
+        }
+        
+        // Step 8: Set Secrets and Bindings using the fetched credentials
         await bot.sendMessage(chatId, "⚙️ Setting secrets and binding KV namespace...");
         
         try {
@@ -247,104 +294,12 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             }
             await bot.sendMessage(chatId, `❌ Automatic configuration failed. Please set manually:\n🆔 UUID: \`${uuid}\`\n🔒 TR_PASS: \`${trojanPass}\``, { parse_mode: 'Markdown' });
         }
-
-        // Step 7: Enable workers.dev subdomain
-        await bot.sendMessage(chatId, "🌐 Enabling workers.dev subdomain...");
         
-        try {
-            const subdomainResponse = await axios.put(
-                `${CF_API_BASE}/accounts/${accountId}/workers/subdomain`,
-                { enabled: true },
-                { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
-            );
-
-            if (subdomainResponse.data.success) {
-                await bot.sendMessage(chatId, "✅ Workers.dev subdomain enabled!");
-            } else {
-                console.log('Subdomain enable failed:', subdomainResponse.data.errors);
-                await bot.sendMessage(chatId, "⚠️ Subdomain API failed - please enable workers.dev manually in Cloudflare dashboard");
-            }
-        } catch (subdomainError) {
-            console.log('Subdomain enable error:', {
-                message: subdomainError.message,
-                response: subdomainError.response?.data,
-                status: subdomainError.response?.status
-            });
-            await bot.sendMessage(chatId, "⚠️ Subdomain configuration failed - please enable workers.dev manually in Cloudflare dashboard");
-        }
-
-        // Step 8: Get the worker URL first (needed to fetch panel credentials)
-        const workerUrl = `https://${workerName}.${accountId.slice(0, 8)}.workers.dev`;
-        const panelUrl = `${workerUrl}/panel`;
-        
-        await bot.sendMessage(chatId, `🔗 Worker URL: ${workerUrl}`);
-
-        // Step 9: Wait for worker to be ready and fetch credentials from BPB panel
-        await bot.sendMessage(chatId, "⏳ Waiting for worker to initialize...");
-        await sleep(30000); // Wait 30 seconds for worker to be ready
-
-        let uuid, trojanPass;
-        
-        try {
-            await bot.sendMessage(chatId, "🔍 Fetching credentials from BPB panel...");
-            
-            // Try to get the credentials from the panel's secret generator
-            const secretsResponse = await axios.get(`${workerUrl}/secrets`, {
-                timeout: 15000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            });
-            
-            if (secretsResponse.data) {
-                const htmlContent = secretsResponse.data;
-                console.log('Panel response preview:', htmlContent.substring(0, 500));
-                
-                // Look for UUID pattern in the HTML (more flexible regex)
-                const uuidMatch = htmlContent.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi);
-                
-                // Look for Trojan password (try multiple patterns)
-                let trojanMatch = htmlContent.match(/Random Trojan Password[^>]*>([^<]+)</i);
-                if (!trojanMatch) {
-                    trojanMatch = htmlContent.match(/Trojan Password[^>]*>([^<]+)</i);
-                }
-                if (!trojanMatch) {
-                    trojanMatch = htmlContent.match(/password[^>]*>([A-Za-z0-9\[\]_\\]{8,})</i);
-                }
-                
-                if (uuidMatch && uuidMatch.length > 0 && trojanMatch) {
-                    uuid = uuidMatch[0];
-                    trojanPass = trojanMatch[1].trim();
-                    
-                    await bot.sendMessage(chatId, `✅ Fetched credentials from BPB panel:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
-                } else {
-                    throw new Error('Could not parse credentials from panel HTML');
-                }
-            } else {
-                throw new Error('Panel response was empty');
-            }
-            
-        } catch (fetchError) {
-            console.log('Failed to fetch credentials from panel:', fetchError.message);
-            if (fetchError.response) {
-                console.log('Panel response status:', fetchError.response.status);
-                console.log('Panel response preview:', fetchError.response.data?.substring(0, 200));
-            }
-            
-            await bot.sendMessage(chatId, "⚠️ Could not fetch credentials from panel, generating temporary ones...");
-            
-            // Fallback to generating temporary credentials
-            uuid = generateUUID();
-            trojanPass = generateTrojanPassword();
-            
-            await bot.sendMessage(chatId, `🔐 Generated temporary credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
-        }
-
-        // Step 8: Final wait for panel to be fully ready
+        // Step 9: Final wait for panel to be fully ready
         await bot.sendMessage(chatId, "⏳ Final wait for BPB panel to be fully configured...");
         await sleep(30000); // Wait 30 more seconds
 
-        // Step 11: Send final result (escape special characters for Telegram)
+        // Step 10: Send final result (escape special characters for Telegram)
         const escapedUuid = uuid.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
         const escapedTrojanPass = trojanPass.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
         const escapedWorkerName = workerName.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
