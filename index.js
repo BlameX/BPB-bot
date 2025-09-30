@@ -148,14 +148,24 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             };
         }
 
-        const createWorkerResponse = await axios.put(
-            `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}`,
-            form,
-            { headers }
-        );
+        try {
+            const createWorkerResponse = await axios.put(
+                `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}`,
+                form,
+                { headers }
+            );
 
-        if (!createWorkerResponse.data.success) {
-            throw new Error('Failed to create worker: ' + JSON.stringify(createWorkerResponse.data.errors));
+            if (!createWorkerResponse.data.success) {
+                console.log('Worker creation failed:', createWorkerResponse.data);
+                throw new Error('Failed to create worker: ' + JSON.stringify(createWorkerResponse.data.errors));
+            }
+        } catch (workerError) {
+            console.log('Worker creation error:', workerError.message);
+            if (workerError.response) {
+                console.log('Worker creation error response:', workerError.response.data);
+                console.log('Worker creation error status:', workerError.response.status);
+            }
+            throw new Error('Failed to create worker: ' + workerError.message);
         }
 
         await bot.sendMessage(chatId, "✅ Worker created successfully!");
