@@ -208,73 +208,61 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
         
         await bot.sendMessage(chatId, `🔐 Generated credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
 
-        // Step 7: Set KV binding (this was working!)
-        await bot.sendMessage(chatId, "🔗 Binding KV namespace to worker...");
+        // Step 7: Set Secrets and Bindings using the "Wizard Method" - single multipart request
+        await bot.sendMessage(chatId, "⚙️ Setting secrets and binding KV namespace...");
         
         try {
-            const bindingResponse = await axios.put(
-                `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}/bindings`,
-                {
-                    bindings: [
-                        {
-                            type: "kv_namespace",
-                            name: "kv",
-                            namespace_id: kvNamespaceId
-                        }
-                    ]
-                },
-                { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
+            const settingsPayload = {
+                "body_part": "script_settings",
+                "bindings": [
+                    {
+                        "type": "kv_namespace",
+                        "name": "kv",
+                        "namespace_id": kvNamespaceId
+                    }
+                ],
+                "secrets": [
+                    {
+                        "name": "UUID",
+                        "text": uuid,
+                        "type": "secret_text"
+                    },
+                    {
+                        "name": "TR_PASS",
+                        "text": trojanPass,
+                        "type": "secret_text"
+                    }
+                ]
+            };
+
+            const multiPartHeaders = (email && globalKey) ? {
+                'X-Auth-Email': email,
+                'X-Auth-Key': globalKey,
+            } : {
+                'Authorization': `Bearer ${apiToken}`,
+            };
+
+            const settingsForm = new FormData();
+            settingsForm.append('script_settings', JSON.stringify(settingsPayload), { contentType: 'application/json' });
+            
+            const settingsResponse = await axios.put(
+                `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}`,
+                settingsForm,
+                { headers: { ...multiPartHeaders, ...settingsForm.getHeaders() } }
             );
 
-            if (!bindingResponse.data.success) {
-                throw new Error('Failed to set KV binding: ' + JSON.stringify(bindingResponse.data.errors));
+            if (!settingsResponse.data.success) {
+                throw new Error('Failed to set secrets and bindings: ' + JSON.stringify(settingsResponse.data.errors));
             }
 
-            await bot.sendMessage(chatId, "✅ KV namespace bound successfully!");
+            await bot.sendMessage(chatId, "✅ Secrets and bindings configured successfully!");
 
-        } catch (bindingError) {
-            console.log('KV binding failed:', bindingError.message);
-            if (bindingError.response) {
-                console.log('Binding error response:', bindingError.response.data);
+        } catch (settingsError) {
+            console.log('Settings configuration failed:', settingsError.message);
+            if (settingsError.response) {
+                console.log('Settings error response:', settingsError.response.data);
             }
-            await bot.sendMessage(chatId, "❌ Failed to bind KV namespace. Please set manually in Cloudflare dashboard.");
-        }
-
-        // Step 8: Set secrets using the correct API endpoint
-        await bot.sendMessage(chatId, "🔐 Setting worker secrets...");
-        
-        try {
-            const secretsResponse = await axios.put(
-                `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}/secrets`,
-                {
-                    secrets: [
-                        {
-                            name: "UUID",
-                            text: uuid,
-                            type: "secret_text"
-                        },
-                        {
-                            name: "TR_PASS",
-                            text: trojanPass,
-                            type: "secret_text"
-                        }
-                    ]
-                },
-                { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
-            );
-
-            if (!secretsResponse.data.success) {
-                throw new Error('Failed to set secrets: ' + JSON.stringify(secretsResponse.data.errors));
-            }
-
-            await bot.sendMessage(chatId, "✅ Secrets configured successfully!");
-
-        } catch (secretsError) {
-            console.log('Secrets configuration failed:', secretsError.message);
-            if (secretsError.response) {
-                console.log('Secrets error response:', secretsError.response.data);
-            }
-            await bot.sendMessage(chatId, `❌ Failed to set secrets automatically. Please set manually:\n🆔 UUID: \`${uuid}\`\n🔒 TR_PASS: \`${trojanPass}\``, { parse_mode: 'Markdown' });
+            await bot.sendMessage(chatId, `❌ Automatic configuration failed. Please set manually:\n🆔 UUID: \`${uuid}\`\n🔒 TR_PASS: \`${trojanPass}\``, { parse_mode: 'Markdown' });
         }
 
         // Step 9: Get worker URL and wait for it to be ready
@@ -365,7 +353,7 @@ ACCOUNT_ID: your_account_id_here
 1️⃣ **Workers Scripts**: Edit
 2️⃣ **Workers KV Storage**: Edit
 3️⃣ **Account Settings**: Edit
-4️⃣ **Workers Subdomain**: Edit
+4️⃣ **Workers Sub/Pub**: Edit
 5️⃣ **Zone**: DNS - Edit
 
 📝 **How to get your credentials:**
@@ -482,6 +470,7 @@ bot.onText(/\/help/, (msg) => {
      - Account: Workers Scripts - Edit
      - Account: Workers KV Storage - Edit
      - Account: Account Settings - Read
+     - Account: Workers Sub/Pub - Edit
    • Include: All accounts
 
 2️⃣ **Cloudflare Account ID:**
