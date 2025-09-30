@@ -117,17 +117,73 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             preview: workerCode.substring(0, 200) + '...'
         });
 
-        // Step 3: Create the worker using proper multipart form data for ES modules
+        // Step 3: Create KV namespace first (needed for worker bindings)
+        await bot.sendMessage(chatId, "🗄️ Creating KV namespace...");
+        const kvResponse = await axios.post(
+            `${CF_API_BASE}/accounts/${accountId}/storage/kv/namespaces`,
+            { title: `${workerName}-kv` },
+            { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
+        );
+
+        if (!kvResponse.data.success) {
+            throw new Error('Failed to create KV namespace: ' + JSON.stringify(kvResponse.data.errors));
+        }
+
+        const kvNamespaceId = kvResponse.data.result.id;
+        await bot.sendMessage(chatId, "✅ KV namespace created!");
+
+        // Step 4: Generate credentials
+        const uuid = generateUUID();
+        const trojanPass = generateTrojanPassword();
+        await bot.sendMessage(chatId, `🔐 Generated credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
+
+        // Step 5: Create the worker using BPB-Wizard approach
         await bot.sendMessage(chatId, "⚡ Creating Cloudflare Worker...");
         
         const form = new FormData();
         
-        // Add metadata for ES module
-        form.append('metadata', JSON.stringify({
+        // Add metadata with bindings (like BPB-Wizard does)
+        const metadata = {
             main_module: 'worker.js',
-            compatibility_date: '2023-05-18'
-        }), {
+            bindings: [
+                {
+                    name: "kv",
+                    namespace_id: kvNamespaceId,
+                    type: "kv_namespace"
+                },
+                {
+                    name: "UUID",
+                    text: uuid,
+                    type: "plain_text"
+                },
+                {
+                    name: "TR_PASS", 
+                    text: trojanPass,
+                    type: "plain_text"
+                }
+            ],
+            compatibility_date: new Date().toISOString().split('T')[0],
+            compatibility_flags: ["nodejs_compat"],
+            observability: { enabled: false },
+            placement: {},
+            tags: [],
+            tail_consumers: [],
+            logpush: false,
+            usage_model: "standard"
+        };
+        
+        form.append('metadata', JSON.stringify(metadata), {
             contentType: 'application/json'
+        });
+        
+        // Add package.json (like BPB-Wizard does)
+        form.append('package.json', '{"name":"worker","version":"1.0.0"}', {
+            contentType: 'text/plain'
+        });
+        
+        // Add package-lock.json (like BPB-Wizard does)
+        form.append('package-lock.json', '{"name":"worker","version":"1.0.0"}', {
+            contentType: 'text/plain'
         });
         
         // Add the worker code as ES module
@@ -170,7 +226,7 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
 
         await bot.sendMessage(chatId, "✅ Worker created successfully!");
 
-        // Step 4: Enable workers.dev subdomain
+        // Step 6: Enable workers.dev subdomain
         await bot.sendMessage(chatId, "🌐 Enabling workers.dev subdomain...");
         
         try {
@@ -193,86 +249,6 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
                 status: subdomainError.response?.status
             });
             await bot.sendMessage(chatId, "⚠️ Subdomain configuration failed - please enable workers.dev manually in Cloudflare dashboard");
-        }
-
-        // Step 5: Create KV namespace
-        await bot.sendMessage(chatId, "🗄️ Creating KV namespace...");
-        const kvResponse = await axios.post(
-            `${CF_API_BASE}/accounts/${accountId}/storage/kv/namespaces`,
-            { title: `${workerName}-kv` },
-            { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
-        );
-
-        if (!kvResponse.data.success) {
-            throw new Error('Failed to create KV namespace: ' + JSON.stringify(kvResponse.data.errors));
-        }
-
-        const kvNamespaceId = kvResponse.data.result.id;
-        await bot.sendMessage(chatId, "✅ KV namespace created!");
-
-        // Step 6: Generate credentials that the worker will use
-        await bot.sendMessage(chatId, "🔐 Generating credentials for BPB panel...");
-        
-        const uuid = generateUUID();
-        const trojanPass = generateTrojanPassword();
-        
-        await bot.sendMessage(chatId, `🔐 Generated credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
-
-        // Step 7: Set Secrets and Bindings using the "Wizard Method" - single multipart request
-        await bot.sendMessage(chatId, "⚙️ Setting secrets and binding KV namespace...");
-        
-        try {
-            const settingsPayload = {
-                "body_part": "script_settings",
-                "bindings": [
-                    {
-                        "type": "kv_namespace",
-                        "name": "kv",
-                        "namespace_id": kvNamespaceId
-                    }
-                ],
-                "secrets": [
-                    {
-                        "name": "UUID",
-                        "text": uuid,
-                        "type": "secret_text"
-                    },
-                    {
-                        "name": "TR_PASS",
-                        "text": trojanPass,
-                        "type": "secret_text"
-                    }
-                ]
-            };
-
-            const multiPartHeaders = (email && globalKey) ? {
-                'X-Auth-Email': email,
-                'X-Auth-Key': globalKey,
-            } : {
-                'Authorization': `Bearer ${apiToken}`,
-            };
-
-            const settingsForm = new FormData();
-            settingsForm.append('script_settings', JSON.stringify(settingsPayload), { contentType: 'application/json' });
-            
-            const settingsResponse = await axios.put(
-                `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}`,
-                settingsForm,
-                { headers: { ...multiPartHeaders, ...settingsForm.getHeaders() } }
-            );
-
-            if (!settingsResponse.data.success) {
-                throw new Error('Failed to set secrets and bindings: ' + JSON.stringify(settingsResponse.data.errors));
-            }
-
-            await bot.sendMessage(chatId, "✅ Secrets and bindings configured successfully!");
-
-        } catch (settingsError) {
-            console.log('Settings configuration failed:', settingsError.message);
-            if (settingsError.response) {
-                console.log('Settings error response:', settingsError.response.data);
-            }
-            await bot.sendMessage(chatId, `❌ Automatic configuration failed. Please set manually:\n🆔 UUID: \`${uuid}\`\n🔒 TR_PASS: \`${trojanPass}\``, { parse_mode: 'Markdown' });
         }
 
         // Step 9: Get worker URL and wait for it to be ready
