@@ -1,471 +1,270 @@
-const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const crypto = require('crypto');
-const FormData = require('form-data');
+import 'dotenv/config';
+import crypto from 'crypto';
+import Database from 'better-sqlite3';
+import { Telegraf, session } from 'telegraf';
+import axios from 'axios';
+import FormData from 'form-data';
 
-// Environment variables
-const BOT_TOKEN = process.env.BOT_TOKEN;
+// ====== ENV ======
+const {
+  TELEGRAM_BOT_TOKEN,
+  MASTER_KEY,
+  WORKER_JS_URL = 'https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/v3.5.6/worker.js'
+} = process.env;
 
-// Cloudflare API base URL
-const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
-
-// Create bot instance
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-// Store user sessions (in memory - for production use Redis)
-const userSessions = new Map();
-
-// Generate random UUID
-function generateUUID() {
-    return crypto.randomUUID();
+if (!TELEGRAM_BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN');
+if (!MASTER_KEY || MASTER_KEY.length < 24) {
+  throw new Error('MASTER_KEY must be a long random string (>=24 chars)');
 }
 
-// Generate random Trojan password
-function generateTrojanPassword() {
-    return crypto.randomBytes(16).toString('hex');
+// ====== DB (SQLite on persistent volume) ======
+const db = new Database('/data/bot.db');
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  tg_id TEXT PRIMARY KEY,
+  cf_account_id TEXT NOT NULL,
+  cf_token_enc BLOB NOT NULL,
+  worker_name TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`);
+
+// ====== Simple AES-GCM helpers ======
+function enc(plaintext) {
+  const iv = crypto.randomBytes(12);
+  const key = crypto.createHash('sha256').update(MASTER_KEY).digest();
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ct]); // 12|16|N
+}
+function dec(blob) {
+  const key = crypto.createHash('sha256').update(MASTER_KEY).digest();
+  const iv = blob.subarray(0, 12);
+  const tag = blob.subarray(12, 28);
+  const ct  = blob.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
 }
 
-// Sleep function
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Clean up user session
-function cleanupSession(userId) {
-    if (userSessions.has(userId)) {
-        userSessions.delete(userId);
-    }
+// ====== Per-user Cloudflare client builder ======
+function cfClient(cfToken) {
+  return axios.create({
+    baseURL: 'https://api.cloudflare.com/client/v4',
+    headers: { Authorization: `Bearer ${cfToken}` },
+    timeout: 30000
+  });
 }
 
-// Headers for Cloudflare API
-const getHeaders = (apiToken) => ({
-    'Authorization': `Bearer ${apiToken}`,
-    'Content-Type': 'application/json'
-});
-
-// Headers for Cloudflare API using Global API Key
-const getHeadersWithGlobalKey = (email, globalKey) => ({
-    'X-Auth-Email': email,
-    'X-Auth-Key': globalKey,
-    'Content-Type': 'application/json'
-});
-
-// Verify Cloudflare credentials
-async function verifyCloudflareCredentials(apiToken, accountId, email = null, globalKey = null) {
-    try {
-        let headers;
-        if (email && globalKey) {
-            headers = getHeadersWithGlobalKey(email, globalKey);
-        } else {
-            headers = getHeaders(apiToken);
-            // Test API token validity
-            const tokenResponse = await axios.get(
-                `${CF_API_BASE}/user/tokens/verify`,
-                { headers }
-            );
-
-            if (!tokenResponse.data.success) {
-                return { valid: false, error: 'Invalid API token' };
-            }
-        }
-
-        // Test account access
-        const accountResponse = await axios.get(
-            `${CF_API_BASE}/accounts/${accountId}`,
-            { headers }
-        );
-
-        if (!accountResponse.data.success) {
-            return { valid: false, error: 'Invalid Account ID or no access' };
-        }
-
-        return { valid: true };
-    } catch (error) {
-        return { valid: false, error: error.response?.data?.errors?.[0]?.message || 'API verification failed' };
-    }
+// ====== Cloudflare ops ======
+async function getWorkersSubdomain(cf, accountId) {
+  const r = await cf.get(`/accounts/${accountId}/workers/subdomain`);
+  return r.data?.result?.subdomain;
 }
 
-// Main automation function
-async function deployBPBWorker(chatId, accountId, apiToken = null, email = null, globalKey = null) {
-    try {
-        await bot.sendMessage(chatId, "🔍 Verifying your Cloudflare credentials...");
-        
-        const verification = await verifyCloudflareCredentials(apiToken, accountId, email, globalKey);
-        if (!verification.valid) {
-            throw new Error(`Credential verification failed: ${verification.error}`);
-        }
-
-        await bot.sendMessage(chatId, "✅ Credentials verified! Starting BPB Worker deployment...");
-
-        // Step 1: Generate worker name (Cloudflare requires lowercase and hyphens only)
-        const timestamp = Date.now();
-        const workerName = `bpb-worker-${timestamp}`.toLowerCase();
-        await bot.sendMessage(chatId, `📝 Worker name: ${workerName}`);
-
-        // Step 2: Download worker.js code
-        await bot.sendMessage(chatId, "📥 Downloading worker.js code...");
-        const workerCodeResponse = await axios.get('https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/v3.5.6/worker.js');
-        const workerCode = workerCodeResponse.data;
-        
-        // Validate downloaded code
-        if (!workerCode || workerCode.length < 100) {
-            throw new Error('Downloaded worker code is invalid or too short');
-        }
-        
-        console.log('Downloaded worker code:', {
-            length: workerCode.length,
-            startsWithExport: workerCode.includes('export'),
-            startsWithFunction: workerCode.includes('function'),
-            preview: workerCode.substring(0, 200) + '...'
-        });
-
-        // Step 3: Create KV namespace first (needed for worker bindings)
-        await bot.sendMessage(chatId, "🗄️ Creating KV namespace...");
-        const kvResponse = await axios.post(
-            `${CF_API_BASE}/accounts/${accountId}/storage/kv/namespaces`,
-            { title: `${workerName}-kv` },
-            { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
-        );
-
-        if (!kvResponse.data.success) {
-            throw new Error('Failed to create KV namespace: ' + JSON.stringify(kvResponse.data.errors));
-        }
-
-        const kvNamespaceId = kvResponse.data.result.id;
-        await bot.sendMessage(chatId, "✅ KV namespace created!");
-
-        // Step 4: Generate credentials
-        const uuid = generateUUID();
-        const trojanPass = generateTrojanPassword();
-        await bot.sendMessage(chatId, `🔐 Generated credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
-
-        // Step 5: Create the worker using the SIMPLE approach that was working
-        await bot.sendMessage(chatId, "⚡ Creating Cloudflare Worker...");
-        
-        const form = new FormData();
-        
-        // Add metadata
-        form.append('metadata', JSON.stringify({
-            main_module: 'worker.js',
-            compatibility_date: '2023-05-18'
-        }), {
-            contentType: 'application/json'
-        });
-        
-        // Add the worker code as ES module
-        form.append('worker.js', workerCode, {
-            contentType: 'application/javascript+module'
-        });
-        
-        let headers;
-        if (email && globalKey) {
-            headers = {
-                'X-Auth-Email': email,
-                'X-Auth-Key': globalKey,
-                ...form.getHeaders()
-            };
-        } else {
-            headers = {
-                'Authorization': `Bearer ${apiToken}`,
-                ...form.getHeaders()
-            };
-        }
-
-        try {
-            const createWorkerResponse = await axios.put(
-                `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}`,
-                form,
-                { headers }
-            );
-
-            if (!createWorkerResponse.data.success) {
-                console.log('Worker creation failed:', createWorkerResponse.data);
-                throw new Error('Failed to create worker: ' + JSON.stringify(createWorkerResponse.data.errors));
-            }
-        } catch (workerError) {
-            console.log('Worker creation error:', workerError.message);
-            if (workerError.response) {
-                console.log('Worker creation error response:', workerError.response.data);
-            }
-            throw new Error('Failed to create worker: ' + workerError.message);
-        }
-
-        await bot.sendMessage(chatId, "✅ Worker created successfully!");
-
-        // Step 6: Enable workers.dev subdomain
-        await bot.sendMessage(chatId, "🌐 Enabling workers.dev subdomain...");
-        
-        try {
-            const subdomainResponse = await axios.put(
-                `${CF_API_BASE}/accounts/${accountId}/workers/subdomain`,
-                { enabled: true },
-                { headers: (email && globalKey) ? getHeadersWithGlobalKey(email, globalKey) : getHeaders(apiToken) }
-            );
-
-            if (subdomainResponse.data.success) {
-                await bot.sendMessage(chatId, "✅ Workers.dev subdomain enabled!");
-            } else {
-                console.log('Subdomain enable failed:', subdomainResponse.data.errors);
-                await bot.sendMessage(chatId, "⚠️ Subdomain API failed - please enable workers.dev manually in Cloudflare dashboard");
-            }
-        } catch (subdomainError) {
-            console.log('Subdomain enable error:', {
-                message: subdomainError.message,
-                response: subdomainError.response?.data,
-                status: subdomainError.response?.status
-            });
-            await bot.sendMessage(chatId, "⚠️ Subdomain configuration failed - please enable workers.dev manually in Cloudflare dashboard");
-        }
-
-        // Step 9: Get worker URL and wait for it to be ready
-        const workerUrl = `https://${workerName}.${accountId.slice(0, 8)}.workers.dev`;
-        const panelUrl = `${workerUrl}/panel`;
-        
-        await bot.sendMessage(chatId, `🔗 Worker URL: ${workerUrl}`);
-        await bot.sendMessage(chatId, "⏳ Waiting for worker to initialize...");
-        await sleep(30000); // Wait 30 seconds
-
-        // Step 10: Send final result (escape special characters for Telegram)
-        const escapedUuid = uuid.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
-        const escapedTrojanPass = trojanPass.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
-        const escapedWorkerName = workerName.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
-        
-        const successMessage = `
-🎉 *BPB Worker Panel Deployed Successfully\\!*
-
-🌐 *Panel URL:* ${panelUrl}
-
-🔧 *Credentials:*
-🆔 UUID: \`${escapedUuid}\`
-🔒 Trojan Pass: \`${escapedTrojanPass}\`
-
-📋 *Worker Info:*
-📛 Name: ${escapedWorkerName}
-🔗 Worker URL: ${workerUrl}
-🗄️ KV Namespace: ${escapedWorkerName}\\-kv
-
-⚠️ *Important Notes:*
-• The panel may take 2\\-3 minutes to fully initialize
-• If the panel shows an error initially, wait a few minutes and refresh
-• Save your credentials securely \\- I won't store them
-• You can access the panel anytime using the Panel URL
-
-✅ *Setup Complete\\!* Your BPB Worker Panel is ready to use\\.
-
-🔒 *Security Note:* Your Cloudflare credentials have been deleted from memory for security\\.
-        `;
-
-        await bot.sendMessage(chatId, successMessage, { parse_mode: 'MarkdownV2' });
-
-    } catch (error) {
-        console.error('Deployment error:', error);
-        
-        // Get more detailed error information
-        let errorDetails = error.message;
-        if (error.response?.data) {
-            console.error('Cloudflare API Response:', error.response.data);
-            errorDetails += '\n\nCloudflare API Response: ' + JSON.stringify(error.response.data, null, 2);
-        }
-        if (error.response?.status) {
-            console.error('HTTP Status:', error.response.status);
-            errorDetails += '\n\nHTTP Status: ' + error.response.status;
-        }
-        
-        console.error('Full error details:', errorDetails);
-        await bot.sendMessage(chatId, `❌ **Deployment failed:** ${errorDetails}\n\nPlease check your Cloudflare API token and account ID.`, { parse_mode: 'Markdown' });
-    } finally {
-        // Always clean up credentials
-        cleanupSession(chatId);
+async function ensureKvNamespace(cf, accountId, title) {
+  try {
+    const r = await cf.post(`/accounts/${accountId}/storage/kv/namespaces`, { title });
+    return r.data.result.id;
+  } catch (e) {
+    // Reuse if exists
+    if (e?.response?.status === 400) {
+      const list = await cf.get(`/accounts/${accountId}/storage/kv/namespaces`, { params: { per_page: 1000 } });
+      const hit = (list.data?.result || []).find(n => n.title === title);
+      if (hit) return hit.id;
     }
+    throw e;
+  }
 }
 
-// Handle /automation command
-bot.onText(/\/automation/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    const instructionsMessage = `
-🔧 **BPB Worker Panel Deployment**
+async function downloadWorkerScript(url) {
+  const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 60000 });
+  return Buffer.from(r.data);
+}
 
-To deploy your BPB Worker Panel, you can use either an API Token or your Global API Key.
+async function uploadModule(cf, accountId, { workerName, scriptBuf, kvId, vars = {} }) {
+  const metadata = {
+    name: workerName,
+    main_module: 'worker.js',
+    compatibility_date: '2025-01-01',
+    bindings: [{ type: 'kv_namespace', name: 'kv', namespace_id: kvId }],
+    vars
+  };
+  const form = new FormData();
+  form.append('metadata', JSON.stringify(metadata), { contentType: 'application/json' });
+  form.append('worker.js', scriptBuf, { filename: 'worker.js', contentType: 'application/javascript' });
+  const url = `/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}`;
+  const r = await cf.put(url, form, { headers: form.getHeaders() });
+  return r.data;
+}
 
-***METHOD 1: API Token (Recommended)***
-Please send your credentials in this format:
-\`\`\`
-API_TOKEN: your_token_here
-ACCOUNT_ID: your_account_id_here
-\`\`\`
+async function uploadClassic(cf, accountId, { workerName, scriptBuf, kvId, vars = {} }) {
+  const metadata = {
+    body_part: 'script',
+    bindings: [{ type: 'kv_namespace', name: 'kv', namespace_id: kvId }],
+    vars
+  };
+  const form = new FormData();
+  form.append('metadata', JSON.stringify(metadata), { contentType: 'application/json' });
+  form.append('script', scriptBuf, { filename: 'script.js', contentType: 'application/javascript' });
+  const url = `/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}`;
+  const r = await cf.put(url, form, { headers: form.getHeaders() });
+  return r.data;
+}
 
-***METHOD 2: Global API Key (Easier)***
-Please send your credentials in this format:
-\`\`\`
-EMAIL: your_cloudflare_email
-GLOBAL_KEY: your_global_api_key
-ACCOUNT_ID: your_account_id_here
-\`\`\`
-
-📋 **Required API Token Permissions:**
-1️⃣ **Workers Scripts**: Edit
-2️⃣ **Workers KV Storage**: Edit
-3️⃣ **Account Settings**: Edit
-4️⃣ **Workers Sub/Pub**: Edit
-5️⃣ **Zone**: DNS - Edit
-
-📝 **How to get your credentials:**
-1. Go to dash.cloudflare.com
-2. Find your Account ID on the right sidebar.
-3. For an API Token, go to My Profile -> API Tokens.
-4. For the Global Key, find it at the bottom of the API Tokens page.
-
-⚡ **Ready?** Please send your full credentials in one message.
-    `;
-    
-    bot.sendMessage(chatId, instructionsMessage, { parse_mode: 'Markdown' });
-    
-    // Set user in waiting state
-    userSessions.set(chatId, { 
-        state: 'waiting_credentials',
-        timestamp: Date.now()
-    });
-});
-
-// Handle credential input
-bot.on('message', (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
-    
-    if (!text || text.startsWith('/')) return;
-    
-    const session = userSessions.get(chatId);
-    if (!session || session.state !== 'waiting_credentials') return;
-    
-    try {
-        // Parse credentials
-        let apiToken = null;
-        let accountId = null;
-        let email = null;
-        let globalKey = null;
-
-        const lines = text.split('\n');
-        for (const line of lines) {
-            if (line.includes('API_TOKEN:')) {
-                apiToken = line.split('API_TOKEN:')[1].trim();
-            }
-            if (line.includes('ACCOUNT_ID:')) {
-                accountId = line.split('ACCOUNT_ID:')[1].trim();
-            }
-            if (line.includes('EMAIL:')) {
-                email = line.split('EMAIL:')[1].trim();
-            }
-            if (line.includes('GLOBAL_KEY:')) {
-                globalKey = line.split('GLOBAL_KEY:')[1].trim();
-            }
-        }
-        
-        if (accountId && (apiToken || (email && globalKey))) {
-            // Delete the user's message containing credentials
-            bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-            
-            bot.sendMessage(chatId, "🔒 Credentials received and deleted from chat for security. Starting deployment...");
-            deployBPBWorker(chatId, accountId, apiToken, email, globalKey);
-        } else {
-            bot.sendMessage(chatId, "❌ Please send all required credentials in the correct format.", { parse_mode: 'Markdown' });
-        }
-        
-    } catch (error) {
-        bot.sendMessage(chatId, "❌ Error parsing credentials. Please try again with the correct format.");
+async function deployWorker(cf, accountId, args) {
+  try {
+    return await uploadModule(cf, accountId, args);
+  } catch (e) {
+    const msg = JSON.stringify(e?.response?.data?.errors || e.message || '');
+    if (msg.includes('only supports classic') || msg.includes('modules')) {
+      return await uploadClassic(cf, accountId, args);
     }
-});
+    throw e;
+  }
+}
 
-// Handle /start command
-bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    const welcomeMessage = `
-🤖 **BPB Worker Automation Bot**
+function scrapeSecrets(html) {
+  const uuidReA = /["']UUID["']\s*[:=]\s*["']([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})["']/i;
+  const uuidReB = /name=["']UUID["'][^>]*value=["']([0-9a-f-]{36})["']/i;
+  const trA = /["']TR[_-]?PASS["']\s*[:=]\s*["']([A-Za-z0-9\-_.]{6,})["']/i;
+  const trB = /name=["']TR_pass["'][^>]*value=["']([^"']+)["']/i;
+  const uuid = (html.match(uuidReA) || html.match(uuidReB))?.[1];
+  const tr = (html.match(trA) || html.match(trB))?.[1];
+  return (uuid && tr) ? { uuid, tr } : null;
+}
 
-Welcome! This bot helps you automatically deploy BPB Worker Panel on your Cloudflare account.
-
-📋 **Available Commands:**
-/automation - Deploy a new BPB Worker Panel
-/help - Show help and setup instructions
-
-⚡ **What this bot does:**
-• Creates a Cloudflare Worker in YOUR account
-• Downloads and deploys BPB Worker Panel code
-• Creates and binds KV namespace
-• Generates UUID and Trojan password
-• Sets up environment variables
-• Provides you with the final panel URL
-
-🔒 **Privacy & Security:**
-• Your Cloudflare credentials are used only during deployment
-• Credentials are immediately deleted after use
-• Never stored or logged anywhere
-• Only you get access to your panel
-
-🚀 **Ready to start?** Use /automation command!
-    `;
-    
-    bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
-});
-
-// Handle /help command
-bot.onText(/\/help/, (msg) => {
-    const chatId = msg.chat.id;
-    const helpMessage = `
-📖 **Help & Setup Instructions**
-
-🔧 **Before using /automation, you need:**
-
-1️⃣ **Cloudflare API Token:**
-   • Go to: https://dash.cloudflare.com/profile/api-tokens
-   • Click "Create Token"
-   • Use "Custom token"
-   • Add permissions:
-     - Account: Workers Scripts - Edit
-     - Account: Workers KV Storage - Edit
-     - Account: Account Settings - Read
-     - Account: Workers Sub/Pub - Edit
-   • Include: All accounts
-
-2️⃣ **Cloudflare Account ID:**
-   • Go to your Cloudflare dashboard
-   • Account ID is shown in the right sidebar
-   • Copy the ID (looks like: a1b2c3d4e5f6...)
-
-🚀 **Commands:**
-/start - Welcome message
-/automation - Start BPB deployment
-/help - This help message
-
-⚠️ **Important:**
-• Free Cloudflare accounts work perfectly
-• Your credentials are never stored
-• Each deployment creates a new worker
-• The panel takes 2-3 minutes to fully load
-
-❓ **Troubleshooting:**
-• Make sure API token has correct permissions
-• Account ID should be from the same account as the token
-• Wait a few minutes for panel to initialize after deployment
-
-🔒 **Security:** This bot never stores your credentials. They're used once and immediately deleted.
-    `;
-    
-    bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
-});
-
-// Clean up old sessions every 10 minutes
-setInterval(() => {
-    const now = Date.now();
-    for (const [chatId, session] of userSessions.entries()) {
-        // Remove sessions older than 10 minutes
-        if (now - session.timestamp > 10 * 60 * 1000) {
-            userSessions.delete(chatId);
-        }
+async function pollForSecrets(baseUrl) {
+  const candidates = [baseUrl, `${baseUrl}/panel`];
+  for (let i = 0; i < 10; i++) {
+    for (const url of candidates) {
+      try {
+        const res = await axios.get(url, { timeout: 15000 });
+        const vals = scrapeSecrets(String(res.data || ''));
+        if (vals) return vals;
+      } catch {}
     }
-}, 10 * 60 * 1000);
+    await new Promise(r => setTimeout(r, 20000)); // 20s
+  }
+  return null;
+}
 
-// Error handling
-bot.on('polling_error', (error) => {
-    console.error('Polling error:', error);
+// ====== Bot ======
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+bot.use(session());
+
+const getUser = db.prepare('SELECT * FROM users WHERE tg_id = ?');
+const upsertUser = db.prepare(`
+INSERT INTO users (tg_id, cf_account_id, cf_token_enc, worker_name) VALUES (?, ?, ?, ?)
+ON CONFLICT(tg_id) DO UPDATE SET
+  cf_account_id=excluded.cf_account_id,
+  cf_token_enc=excluded.cf_token_enc
+`);
+const setWorker = db.prepare(`UPDATE users SET worker_name = ? WHERE tg_id = ?`);
+const delUser = db.prepare('DELETE FROM users WHERE tg_id = ?');
+
+bot.start(ctx =>
+  ctx.reply(
+    'Hey! Use:\n' +
+    '/connect <CLOUDFLARE_ACCOUNT_ID> → then paste your API Token (Workers+KV: Edit)\n' +
+    '/automation → deploy Worker+KV and get your /panel URL\n' +
+    '/status → connection status\n' +
+    '/forget → delete saved Cloudflare token'
+  )
+);
+
+bot.command('status', (ctx) => {
+  const u = getUser.get(String(ctx.from.id));
+  if (!u) return ctx.reply('Not connected. Use /connect <ACCOUNT_ID>.');
+  return ctx.reply(
+    `Connected ✅\nAccount: ${u.cf_account_id}\nWorker: ${u.worker_name || '—'}`
+  );
 });
 
-console.log('🤖 BPB Automation Bot is running...');
+bot.command('forget', (ctx) => {
+  delUser.run(String(ctx.from.id));
+  ctx.reply('Your Cloudflare token was removed. You can /connect again anytime.');
+});
+
+bot.command('connect', async (ctx) => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length < 2) {
+    return ctx.reply('Usage: /connect <CLOUDFLARE_ACCOUNT_ID>');
+  }
+  const accountId = parts[1];
+  ctx.session = { awaitingToken: { accountId } };
+  return ctx.reply(
+    'Now send your *Cloudflare API Token* **as a reply to this message**.\n' +
+    'Tip: after I save it, you can delete your message on your side.'
+  );
+});
+
+// Capture next message as the API token when waiting
+bot.on('message', async (ctx, next) => {
+  if (!ctx.session?.awaitingToken) return next();
+  const token = (ctx.message.text || '').trim();
+  if (!token || token.length < 20) {
+    return ctx.reply('That does not look like an API token. Please paste the token string.');
+  }
+  const { accountId } = ctx.session.awaitingToken;
+  delete ctx.session.awaitingToken;
+
+  // Save encrypted
+  const blob = enc(token);
+  upsertUser.run(String(ctx.from.id), accountId, blob, null);
+  return ctx.reply('Saved ✅. You can now run /automation');
+});
+
+bot.command('automation', async (ctx) => {
+  const u = getUser.get(String(ctx.from.id));
+  if (!u) return ctx.reply('Not connected. Run /connect <ACCOUNT_ID> first.');
+
+  let cfToken;
+  try { cfToken = dec(u.cf_token_enc); } catch { return ctx.reply('Could not read your token. /connect again.'); }
+  const cf = cfClient(cfToken);
+
+  const workerName = u.worker_name || `bpb-${crypto.randomBytes(3).toString('hex')}`;
+
+  try {
+    await ctx.reply(`🔧 Deploying worker \`${workerName}\` …`);
+    const kvId = await ensureKvNamespace(cf, u.cf_account_id, `kv-${workerName}`);
+    const scriptBuf = await downloadWorkerScript(WORKER_JS_URL);
+    await deployWorker(cf, u.cf_account_id, { workerName, scriptBuf, kvId });
+
+    const subdomain = await getWorkersSubdomain(cf, u.cf_account_id);
+    if (!subdomain) {
+      return ctx.reply('Could not determine your workers.dev subdomain. Open Cloudflare → Workers & Pages once to initialize it.');
+    }
+    const base = `https://${workerName}.${subdomain}.workers.dev`;
+    setWorker.run(workerName, String(ctx.from.id));
+
+    await ctx.reply(`✅ Worker deployed:\n${base}\n⏳ Initializing panel…`);
+
+    const vals = await pollForSecrets(base);
+    if (vals) {
+      await ctx.reply(`Found values. Applying as Worker variables…`);
+      await deployWorker(cf, u.cf_account_id, {
+        workerName,
+        scriptBuf,
+        kvId,
+        vars: { UUID: vals.uuid, TR_pass: vals.tr }
+      });
+      return ctx.reply(`🎉 Done: ${base}/panel`);
+    } else {
+      return ctx.reply(
+        `Could not auto-detect UUID/TR_pass yet.\n` +
+        `Open ${base}/panel, copy the values, then in Cloudflare → Workers → ${workerName} → Settings → Variables, add:\n` +
+        `• UUID = <uuid>\n• TR_pass = <password>\n` +
+        `Save & redeploy. Your panel will be at: ${base}/panel`
+      );
+    }
+  } catch (e) {
+    console.error(e?.response?.data || e);
+    return ctx.reply('❌ Failed to deploy. Check your token scopes and account ID, then try again.');
+  }
+});
+
+bot.launch().then(() => console.log('Bot running'));
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
