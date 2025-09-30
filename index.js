@@ -317,14 +317,16 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
         // Get more detailed error information
         let errorDetails = error.message;
         if (error.response?.data) {
+            console.error('Cloudflare API Response:', error.response.data);
             errorDetails += '\n\nCloudflare API Response: ' + JSON.stringify(error.response.data, null, 2);
         }
         if (error.response?.status) {
+            console.error('HTTP Status:', error.response.status);
             errorDetails += '\n\nHTTP Status: ' + error.response.status;
         }
         
         console.error('Full error details:', errorDetails);
-        await bot.sendMessage(chatId, `❌ **Deployment failed:** ${error.message}\n\nPlease check your Cloudflare API token and account ID.`, { parse_mode: 'Markdown' });
+        await bot.sendMessage(chatId, `❌ **Deployment failed:** ${errorDetails}\n\nPlease check your Cloudflare API token and account ID.`, { parse_mode: 'Markdown' });
     } finally {
         // Always clean up credentials
         cleanupSession(chatId);
