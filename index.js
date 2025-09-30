@@ -340,7 +340,7 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             await bot.sendMessage(chatId, `🔐 Generated temporary credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
         }
 
-        // Step 10: Final wait for panel to be fully ready
+        // Step 8: Final wait for panel to be fully ready
         await bot.sendMessage(chatId, "⏳ Final wait for BPB panel to be fully configured...");
         await sleep(30000); // Wait 30 more seconds
 
