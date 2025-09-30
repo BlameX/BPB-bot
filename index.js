@@ -117,55 +117,51 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             preview: workerCode.substring(0, 200) + '...'
         });
 
-        // Step 3: Create the worker using multipart form data
+        // Step 3: Create the worker using simple approach
         await bot.sendMessage(chatId, "⚡ Creating Cloudflare Worker...");
-        
-        const form = new FormData();
-        // Add metadata
-        form.append('metadata', JSON.stringify({
-            main_module: 'worker.js',
-            compatibility_date: '2023-05-18'
-        }), {
-            contentType: 'application/json'
-        });
-        
-        // Add the worker code
-        form.append('worker.js', workerCode, {
-            contentType: 'application/javascript+module'
-        });
         
         let headers;
         if (email && globalKey) {
-            headers = {
-                'X-Auth-Email': email,
-                'X-Auth-Key': globalKey,
-                ...form.getHeaders()
-            };
+            headers = getHeadersWithGlobalKey(email, globalKey);
+            headers['Content-Type'] = 'application/javascript';
         } else {
             headers = {
                 'Authorization': `Bearer ${apiToken}`,
-                ...form.getHeaders()
+                'Content-Type': 'application/javascript'
             };
         }
 
         try {
+            // Try with ES Module format first
+            headers['Content-Type'] = 'application/javascript+module';
             const createWorkerResponse = await axios.put(
                 `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}`,
-                form,
+                workerCode,
                 { headers }
             );
 
             if (!createWorkerResponse.data.success) {
-                console.log('Worker creation failed:', createWorkerResponse.data);
-                throw new Error('Failed to create worker: ' + JSON.stringify(createWorkerResponse.data.errors));
+                console.log('Worker creation failed (ES module):', createWorkerResponse.data);
+                throw new Error('Failed to create worker (ES module): ' + JSON.stringify(createWorkerResponse.data.errors));
             }
         } catch (workerError) {
-            console.log('Worker creation error:', workerError.message);
+            console.log('ES module upload failed, trying plain JavaScript:', workerError.message);
             if (workerError.response) {
-                console.log('Worker creation error response:', workerError.response.data);
-                console.log('Worker creation error status:', workerError.response.status);
+                console.log('ES module error response:', workerError.response.data);
             }
-            throw new Error('Failed to create worker: ' + workerError.message);
+            
+            // Fallback to plain JavaScript
+            headers['Content-Type'] = 'application/javascript';
+            const fallbackResponse = await axios.put(
+                `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${workerName}`,
+                workerCode,
+                { headers }
+            );
+
+            if (!fallbackResponse.data.success) {
+                console.log('Worker creation failed (both methods):', fallbackResponse.data);
+                throw new Error('Failed to create worker (both methods): ' + JSON.stringify(fallbackResponse.data.errors));
+            }
         }
 
         await bot.sendMessage(chatId, "✅ Worker created successfully!");
