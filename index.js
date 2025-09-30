@@ -137,53 +137,17 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
         const trojanPass = generateTrojanPassword();
         await bot.sendMessage(chatId, `🔐 Generated credentials:\n🆔 UUID: \`${uuid}\`\n🔒 Trojan Pass: \`${trojanPass}\``, { parse_mode: 'Markdown' });
 
-        // Step 5: Create the worker using BPB-Wizard approach
+        // Step 5: Create the worker using the SIMPLE approach that was working
         await bot.sendMessage(chatId, "⚡ Creating Cloudflare Worker...");
         
         const form = new FormData();
         
-        // Add metadata with bindings (like BPB-Wizard does)
-        const metadata = {
+        // Add metadata
+        form.append('metadata', JSON.stringify({
             main_module: 'worker.js',
-            bindings: [
-                {
-                    name: "kv",
-                    namespace_id: kvNamespaceId,
-                    type: "kv_namespace"
-                },
-                {
-                    name: "UUID",
-                    text: uuid,
-                    type: "plain_text"
-                },
-                {
-                    name: "TR_PASS", 
-                    text: trojanPass,
-                    type: "plain_text"
-                }
-            ],
-            compatibility_date: new Date().toISOString().split('T')[0],
-            compatibility_flags: ["nodejs_compat"],
-            observability: { enabled: false },
-            placement: {},
-            tags: [],
-            tail_consumers: [],
-            logpush: false,
-            usage_model: "standard"
-        };
-        
-        form.append('metadata', JSON.stringify(metadata), {
+            compatibility_date: '2023-05-18'
+        }), {
             contentType: 'application/json'
-        });
-        
-        // Add package.json (like BPB-Wizard does)
-        form.append('package.json', '{"name":"worker","version":"1.0.0"}', {
-            contentType: 'text/plain'
-        });
-        
-        // Add package-lock.json (like BPB-Wizard does)
-        form.append('package-lock.json', '{"name":"worker","version":"1.0.0"}', {
-            contentType: 'text/plain'
         });
         
         // Add the worker code as ES module
@@ -220,8 +184,6 @@ async function deployBPBWorker(chatId, accountId, apiToken = null, email = null,
             console.log('Worker creation error:', workerError.message);
             if (workerError.response) {
                 console.log('Worker creation error response:', workerError.response.data);
-                console.log('Worker creation error status:', workerError.response.status);
-                console.log('Worker creation error headers:', workerError.response.headers);
             }
             throw new Error('Failed to create worker: ' + workerError.message);
         }
